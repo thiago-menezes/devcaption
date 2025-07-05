@@ -59,9 +59,10 @@ async fn start_audio_capture(window: tauri::Window, device_name: Option<String>)
     
     thread::spawn(move || {
         let mut audio_buffer = Vec::new();
-        let buffer_duration_ms = 3000; // 3 seconds
-        let sample_rate = 16000.0; // Target sample rate for Whisper
-        let samples_per_buffer = (sample_rate * buffer_duration_ms as f32 / 1000.0) as usize;
+        let buffer_duration_ms = 2000; // Reduced from 3000ms to 2000ms for faster response
+        let target_sample_rate = 16000.0; // Target sample rate for Whisper
+        let source_sample_rate = 48000.0; // Source sample rate from audio capture
+        let samples_per_buffer = (target_sample_rate * buffer_duration_ms as f32 / 1000.0) as usize;
         
         if let Err(e) = system_clone.start_capture_with_device(device_name.clone(), move |audio_data| {
             // Process audio data and emit events
@@ -84,7 +85,7 @@ async fn start_audio_capture(window: tauri::Window, device_name: Option<String>)
                 error!("Failed to emit audio level: {}", e);
             }
             
-            // Convert stereo to mono and resample if needed
+            // Convert stereo to mono
             let mono_data = if audio_data.len() % 2 == 0 {
                 audio_data.chunks_exact(2)
                     .map(|chunk| (chunk[0] + chunk[1]) / 2.0)
@@ -93,17 +94,23 @@ async fn start_audio_capture(window: tauri::Window, device_name: Option<String>)
                 audio_data.to_vec()
             };
             
+            // Simple linear resampling from 48kHz to 16kHz (1/3 ratio)
+            let resampled_data: Vec<f32> = mono_data.iter()
+                .step_by(3) // Take every 3rd sample
+                .copied()
+                .collect();
+            
             // Add to buffer
-            audio_buffer.extend_from_slice(&mono_data);
+            audio_buffer.extend_from_slice(&resampled_data);
             
             // Process when buffer is full
             if audio_buffer.len() >= samples_per_buffer {
                 let chunk = audio_buffer.drain(..samples_per_buffer).collect::<Vec<f32>>();
                 
                 // Enhanced voice activity detection with adjusted threshold
-                let voice_detected = detect_voice_activity(&mono_data, 0.001);
+                let voice_detected = detect_voice_activity(&chunk, 0.0005);
                 
-                if level > 0.05 { // Lowered threshold for more sensitive detection
+                if level > 0.02 { // Lowered from 0.05 for more sensitive detection
                     info!("Audio detected - level: {:.4}, voice_activity: {}, samples: {}", level, voice_detected, chunk.len());
                     
                     if voice_detected {
@@ -120,15 +127,19 @@ async fn start_audio_capture(window: tauri::Window, device_name: Option<String>)
                                         
                                         // Filter out non-speech results and low confidence
                                         if !result.text.trim().is_empty() && 
-                                           result.confidence > 0.2 && // Lowered confidence threshold
+                                           result.confidence > 0.1 && // Lowered confidence threshold from 0.2 to 0.1
                                            !is_noise_transcription(&result.text) {
                                             info!("Accepted transcription: {} (confidence: {:.2})", result.text, result.confidence);
                                             if let Err(e) = window_clone_inner.emit("transcription-result", &result) {
                                                 error!("Failed to emit transcription: {}", e);
                                             }
                                         } else {
-                                            info!("Filtered out transcription: '{}' (confidence: {:.2}, is_noise: {})", 
-                                                result.text, result.confidence, is_noise_transcription(&result.text));
+                                            info!("Filtered out transcription: '{}' (confidence: {:.2}, is_noise: {}, is_empty: {})", 
+                                                result.text, 
+                                                result.confidence, 
+                                                is_noise_transcription(&result.text),
+                                                result.text.trim().is_empty()
+                                            );
                                         }
                                     }
                                     Err(e) => {
@@ -233,12 +244,9 @@ fn detect_voice_activity(audio_data: &[f32], threshold: f64) -> bool {
 fn is_noise_transcription(text: &str) -> bool {
     let text_lower = text.to_lowercase();
     
-    // Common noise patterns in Portuguese and English - more restrictive now
+    // Common noise patterns in Portuguese and English - more permissive now
     let noise_patterns = [
-        "dramatic music", "growls", "growl", "music", "música",
-        "[", "]", "(", ")", "beep", "buzz", "hum", "static",
-        "♪", "♫", "♬", "♭", "♯", "noise", "som", "audio",
-        "background", "fundo", "eco", "echo", "reverb"
+        "[", "]", "(", ")", "♪", "♫", "♬", "♭", "♯"
     ];
     
     // Check if text contains noise indicators
@@ -250,17 +258,17 @@ fn is_noise_transcription(text: &str) -> bool {
     }
     
     // Check for very short transcriptions (likely noise)
-    if text.trim().len() < 2 {
+    if text.trim().len() < 1 {  // Changed from 2 to 1
         info!("Filtering out very short transcription: '{}'", text);
         return true;
     }
     
     // Check for repetitive patterns (like "a a a a")
     let words: Vec<&str> = text.split_whitespace().collect();
-    if words.len() > 2 {
+    if words.len() > 3 {  // Changed from 2 to 3
         let first_word = words[0];
         let repetitions = words.iter().filter(|&&word| word == first_word).count();
-        if repetitions > words.len() / 2 {
+        if repetitions > words.len() * 3 / 4 {  // Changed from 1/2 to 3/4
             info!("Filtering out repetitive pattern: '{}'", text);
             return true;
         }

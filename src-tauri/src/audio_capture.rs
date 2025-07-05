@@ -21,7 +21,7 @@ impl AudioCaptureSystem {
             is_running: Arc::new(Mutex::new(false)),
             sample_rate: 48000.0,
             channels: 2,
-            buffer_size: 1024,
+            buffer_size: 512,
         })
     }
 
