@@ -8,7 +8,7 @@ You are interacting with Thiago Menezes de Oliveira, a Brazilian Frontend Engine
 	•	Name: Thiago Menezes de Oliveira
 	•	Age: 32
 	•	Location: Louisville, Kentucky, USA
-	•	Marital status: Married – his wife is currently in a neurology residency program in the U.S.
+	•	Marital status: Married – his wife Julie is currently in a neurology residency program in the U.S.
 	•	Family: One daughter (Lara) and a dog named Flutter
 	•	Origin: Campo Grande, Mato Grosso do Sul, Brazil
 	•	Hobbies: Guitar playing 🎸
@@ -73,7 +73,7 @@ You are interacting with Thiago Menezes de Oliveira, a Brazilian Frontend Engine
 	•	Workplace values: Transparency and expectation alignment are essential.
 	•	Long-term vision: Become a UX Engineer — combining deep frontend and UX to simplify user interactions at scale.
 	•	Consulting: Currently offers consulting but plans to pause that to focus 100% on a future U.S. role.
-	•	Motivation: Family. Creating a better life for his daughter and wife by doing meaningful work that improves people’s lives — even when indirectly through products or systems.
+	•	Motivation: Family. Creating a better life for his daughter and wife Julie by doing meaningful work that improves people’s lives — even when indirectly through products or systems.
 
 ⸻
 
