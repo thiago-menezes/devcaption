@@ -6,6 +6,7 @@ use tauri::Emitter;
 use serde_json;
 use std::time::{SystemTime, UNIX_EPOCH, Duration, Instant};
 use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
+use std::sync::mpsc;
 
 mod audio_capture;
 mod speech_recognition;
@@ -38,13 +39,19 @@ static SPEECH_RECOGNIZER: Mutex<Option<Arc<Mutex<SpeechRecognizer>>>> = Mutex::n
 // Add this near the top with other static variables
 static LAST_TRANSCRIPTION_TIME: AtomicU64 = AtomicU64::new(0);
 static TRANSCRIPTION_BUFFER: Mutex<String> = Mutex::new(String::new());
+static CURRENT_SESSION_TEXT: Mutex<String> = Mutex::new(String::new());
 static IS_RECORDING: AtomicBool = AtomicBool::new(false);
 static LAST_VOICE_TIME: Mutex<Option<Instant>> = Mutex::new(None);
+static RECORDING_START_TIME: Mutex<Option<Instant>> = Mutex::new(None);
+static LAST_PARTIAL_PROCESSING: Mutex<Option<Instant>> = Mutex::new(None);
+static IS_PROCESSING: AtomicBool = AtomicBool::new(false);
 
 // Constants
 const GEMINI_API_KEY: &str = "AIzaSyBzcVnMVBRXHGWbAhAaSQdoubc6YuLkcv8";
-const SILENCE_THRESHOLD: f64 = 0.1; // 10% threshold
+const SILENCE_THRESHOLD: f64 = 0.05; // 5% threshold (more sensitive to catch quiet speech)
 const SILENCE_DELAY: Duration = Duration::from_millis(800); // 0.8s delay
+const STREAMING_CHUNK_SIZE: usize = 80000; // ~5 seconds at 16kHz for streaming
+const MIN_CHUNK_SIZE: usize = 16000; // ~1 second minimum before processing
 
 #[tauri::command]
 async fn start_audio_capture(window: tauri::Window, device_name: Option<String>) -> Result<String, String> {
@@ -130,10 +137,45 @@ async fn start_audio_capture(window: tauri::Window, device_name: Option<String>)
                     info!("Voice detected, starting recording");
                     IS_RECORDING.store(true, Ordering::Relaxed);
                     audio_buffer.clear(); // Clear any old data
+                    
+                    // Reset session text for new recording
+                    if let Ok(mut session_text) = CURRENT_SESSION_TEXT.lock() {
+                        session_text.clear();
+                    }
+                    
+                    // Set recording start time
+                    if let Ok(mut recording_start_time) = RECORDING_START_TIME.lock() {
+                        *recording_start_time = Some(now);
+                    }
+                    if let Ok(mut last_partial_processing) = LAST_PARTIAL_PROCESSING.lock() {
+                        *last_partial_processing = Some(now);
+                    }
                 }
                 
                 // Add current data to buffer
                 audio_buffer.extend_from_slice(&resampled_data);
+                
+                // Streaming processing: process chunks as we go for long speech
+                if audio_buffer.len() >= STREAMING_CHUNK_SIZE && !IS_PROCESSING.load(Ordering::Relaxed) {
+                    info!("Streaming mode: processing chunk with {} samples", STREAMING_CHUNK_SIZE);
+                    
+                    IS_PROCESSING.store(true, Ordering::Relaxed);
+                    
+                    // Take a chunk for processing, keep overlap for continuity
+                    let overlap_size = 8000; // 0.5 second overlap
+                    let chunk_to_process = audio_buffer[..STREAMING_CHUNK_SIZE].to_vec();
+                    
+                    // Remove processed part but keep overlap
+                    audio_buffer.drain(..(STREAMING_CHUNK_SIZE - overlap_size));
+                    
+                    let recognizer_clone = recognizer.clone();
+                    let window_clone_inner = window_clone2.clone();
+                    
+                    thread::spawn(move || {
+                        process_audio_chunk(recognizer_clone, window_clone_inner, chunk_to_process, false);
+                        IS_PROCESSING.store(false, Ordering::Relaxed);
+                    });
+                }
                 
             } else {
                 // No voice, check if we should stop recording
@@ -146,58 +188,36 @@ async fn start_audio_capture(window: tauri::Window, device_name: Option<String>)
                                 info!("Silence detected for {:.2}s, stopping recording and processing", silence_duration.as_secs_f64());
                                 IS_RECORDING.store(false, Ordering::Relaxed);
                                 
-                                // Process the accumulated audio
-                                if !audio_buffer.is_empty() {
-                                    let chunk_to_process = audio_buffer.clone();
-                                    audio_buffer.clear();
+                                // Process the accumulated audio - always process final chunk
+                                if !audio_buffer.is_empty() && audio_buffer.len() >= MIN_CHUNK_SIZE {
+                                    // Wait for current processing to finish, but don't block forever
+                                    let mut wait_count = 0;
+                                    while IS_PROCESSING.load(Ordering::Relaxed) && wait_count < 20 {
+                                        thread::sleep(Duration::from_millis(100));
+                                        wait_count += 1;
+                                    }
                                     
-                                    info!("Processing accumulated audio with {} samples", chunk_to_process.len());
-                                    
-                                    let recognizer_clone = recognizer.clone();
-                                    let window_clone_inner = window_clone2.clone();
-                                    
-                                    thread::spawn(move || {
-                                        if let Ok(recognizer_lock) = recognizer_clone.lock() {
-                                            match recognizer_lock.transcribe_audio(&chunk_to_process) {
-                                                Ok(result) => {
-                                                    info!("Transcription result: '{}' (confidence: {:.2})", 
-                                                        result.text, result.confidence);
-                                                    
-                                                    let result = TranscriptionResult {
-                                                        text: result.text.trim().to_string(),
-                                                        confidence: result.confidence,
-                                                        timestamp: SystemTime::now()
-                                                            .duration_since(UNIX_EPOCH)
-                                                            .unwrap()
-                                                            .as_millis() as u64,
-                                                        is_final: true,  // Mark as final since we're done recording
-                                                    };
-                                                    
-                                                    // Filter out unwanted results
-                                                    let should_skip = result.text.is_empty() 
-                                                        || result.text.contains("[BLANK_AUDIO]")
-                                                        || result.text.trim() == "you"
-                                                        || result.text.trim().matches("you").count() > 2;
-                                                    
-                                                    if !should_skip {
-                                                        info!("Sending final transcription: {}", result.text);
-                                                        if let Err(e) = window_clone_inner.emit("transcription-result", &result) {
-                                                            error!("Failed to emit transcription: {}", e);
-                                                        }
-                                                        
-                                                        LAST_TRANSCRIPTION_TIME.store(result.timestamp, Ordering::Relaxed);
-                                                    } else {
-                                                        info!("Skipping unwanted result: {}", result.text);
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    error!("Transcription error: {}", e);
-                                                }
-                                            }
-                                        } else {
-                                            error!("Failed to acquire recognizer lock");
-                                        }
-                                    });
+                                    if !IS_PROCESSING.load(Ordering::Relaxed) {
+                                        IS_PROCESSING.store(true, Ordering::Relaxed);
+                                        
+                                        // Move data instead of cloning
+                                        let chunk_to_process = std::mem::replace(&mut audio_buffer, Vec::new());
+                                        
+                                        info!("Processing final accumulated audio with {} samples", chunk_to_process.len());
+                                        
+                                        let recognizer_clone = recognizer.clone();
+                                        let window_clone_inner = window_clone2.clone();
+                                        
+                                        thread::spawn(move || {
+                                            process_audio_chunk(recognizer_clone, window_clone_inner, chunk_to_process, true);
+                                            IS_PROCESSING.store(false, Ordering::Relaxed);
+                                        });
+                                    } else {
+                                        info!("Skipping final processing - still processing previous chunk");
+                                    }
+                                } else if !audio_buffer.is_empty() {
+                                    info!("Skipping final processing - chunk too small: {} samples", audio_buffer.len());
+                                    audio_buffer.clear(); // Clear small chunks
                                 }
                             }
                         }
@@ -228,8 +248,18 @@ async fn stop_audio_capture() -> Result<String, String> {
         
         // Reset recording state
         IS_RECORDING.store(false, Ordering::Relaxed);
+        IS_PROCESSING.store(false, Ordering::Relaxed);
         if let Ok(mut last_voice_time) = LAST_VOICE_TIME.lock() {
             *last_voice_time = None;
+        }
+        if let Ok(mut recording_start_time) = RECORDING_START_TIME.lock() {
+            *recording_start_time = None;
+        }
+        if let Ok(mut last_partial_processing) = LAST_PARTIAL_PROCESSING.lock() {
+            *last_partial_processing = None;
+        }
+        if let Ok(mut session_text) = CURRENT_SESSION_TEXT.lock() {
+            session_text.clear();
         }
         
         Ok("Audio capture and transcription stopped".to_string())
@@ -254,6 +284,110 @@ async fn check_permissions() -> Result<bool, String> {
 async fn request_permissions() -> Result<bool, String> {
     info!("Requesting audio permissions...");
     AudioCaptureSystem::request_permissions().map_err(|e| e.to_string())
+}
+
+fn process_audio_chunk(recognizer: Arc<Mutex<SpeechRecognizer>>, window: tauri::Window, chunk_to_process: Vec<f32>, is_final: bool) {
+    info!("Starting audio processing with {} samples", chunk_to_process.len());
+    
+    // Use channel for timeout
+    let (tx, rx) = mpsc::channel();
+    let recognizer_clone = recognizer.clone();
+    
+    // Spawn processing in separate thread
+    thread::spawn(move || {
+        let result = if let Ok(recognizer_lock) = recognizer_clone.try_lock() {
+            match recognizer_lock.transcribe_audio(&chunk_to_process) {
+                Ok(result) => Some(result),
+                Err(e) => {
+                    error!("Transcription error: {}", e);
+                    None
+                }
+            }
+        } else {
+            error!("Failed to acquire recognizer lock - skipping this chunk");
+            None
+        };
+        
+        let _ = tx.send(result); // Send result or None
+    });
+    
+    // Wait for result with timeout (increased for better reliability)
+    match rx.recv_timeout(Duration::from_secs(15)) {
+        Ok(Some(result)) => {
+            info!("Transcription result: '{}' (confidence: {:.2})", 
+                result.text, result.confidence);
+            
+            let transcribed_text = result.text.trim().to_string();
+            
+            // Filter out unwanted results
+            let should_skip = transcribed_text.is_empty() 
+                || transcribed_text.contains("[BLANK_AUDIO]")
+                || transcribed_text.trim() == "you"
+                || transcribed_text.trim().matches("you").count() > 2;
+            
+            if !should_skip {
+                // Handle text accumulation based on type
+                if let Ok(mut session_text) = CURRENT_SESSION_TEXT.lock() {
+                    if is_final {
+                        // For final results, add to accumulated text permanently
+                        if !session_text.is_empty() && !session_text.ends_with(' ') {
+                            session_text.push(' ');
+                        }
+                        session_text.push_str(&transcribed_text);
+                        
+                        let final_result = TranscriptionResult {
+                            text: session_text.clone(),
+                            confidence: result.confidence,
+                            timestamp: SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap()
+                                .as_millis() as u64,
+                            is_final: true,
+                        };
+                        
+                        info!("Sending FINAL accumulated transcription: {}", final_result.text);
+                        if let Err(e) = window.emit("transcription-result", &final_result) {
+                            error!("Failed to emit final transcription: {}", e);
+                        }
+                        
+                        LAST_TRANSCRIPTION_TIME.store(final_result.timestamp, Ordering::Relaxed);
+                    } else {
+                        // For streaming partial results, add to accumulated text for display
+                        // but don't make it permanent until final
+                        if !session_text.is_empty() && !session_text.ends_with(' ') {
+                            session_text.push(' ');
+                        }
+                        session_text.push_str(&transcribed_text);
+                        
+                        let partial_result = TranscriptionResult {
+                            text: session_text.clone(),
+                            confidence: result.confidence,
+                            timestamp: SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap()
+                                .as_millis() as u64,
+                            is_final: false,
+                        };
+                        
+                        info!("Sending PARTIAL accumulated transcription: {}", partial_result.text);
+                        if let Err(e) = window.emit("transcription-result", &partial_result) {
+                            error!("Failed to emit partial transcription: {}", e);
+                        }
+                    }
+                }
+            } else {
+                info!("Skipping unwanted result: {}", transcribed_text);
+            }
+        }
+        Ok(None) => {
+            info!("Transcription returned no result");
+        }
+        Err(_) => {
+            error!("Transcription timeout after 15 seconds - skipping this chunk");
+        }
+    }
+    
+    info!("Audio processing completed");
 }
 
 fn calculate_audio_level(audio_data: &[f32]) -> f64 {
