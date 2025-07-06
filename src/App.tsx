@@ -43,29 +43,30 @@ function App() {
   const [geminiResponse, setGeminiResponse] = useState<string>("");
   const [debugLog, setDebugLog] = useState<string[]>([]);
   const [currentResponse, setCurrentResponse] = useState<string>("");
-  
+  const [isFirstQuestion, setIsFirstQuestion] = useState(true);
+
   const transcriptionRef = useRef<HTMLDivElement>(null);
   const audioLevelRef = useRef<HTMLDivElement>(null);
 
   const addDebugLog = (message: string) => {
     console.log(message);
-    setDebugLog(prev => [...prev, `${new Date().toISOString()}: ${message}`]);
+    setDebugLog((prev) => [...prev, `${new Date().toISOString()}: ${message}`]);
   };
 
   useEffect(() => {
     // Check permissions on startup
     checkPermissions();
-    
+
     // Get available audio devices
     getAudioDevices();
-    
+
     // Listen for audio level updates
     addDebugLog("Setting up event listeners");
 
-    const unlisten = listen<AudioLevel>('audio-level', (event) => {
+    const unlisten = listen<AudioLevel>("audio-level", (event) => {
       const { level } = event.payload;
       setAudioLevel(level);
-      
+
       // Update audio level visualization
       if (audioLevelRef.current) {
         const percentage = Math.min(level * 100, 100);
@@ -74,27 +75,31 @@ function App() {
     });
 
     // Listen for transcription results
-    const unlistenTranscription = listen<TranscriptionResult>('transcription-result', (event) => {
-      const { text, confidence, is_final } = event.payload;
-      
-      if (is_final) {
-        setTranscriptionText(prev => prev + " " + text);
-        setCurrentTranscription("");
-      } else {
-        setCurrentTranscription(text);
+    const unlistenTranscription = listen<TranscriptionResult>(
+      "transcription-result",
+      (event) => {
+        const { text, confidence, is_final } = event.payload;
+
+        if (is_final) {
+          setTranscriptionText((prev) => prev + " " + text);
+          setCurrentTranscription("");
+        } else {
+          setCurrentTranscription(text);
+        }
+
+        setConfidence(confidence);
+
+        // Auto-scroll to bottom
+        if (transcriptionRef.current) {
+          transcriptionRef.current.scrollTop =
+            transcriptionRef.current.scrollHeight;
+        }
       }
-      
-      setConfidence(confidence);
-      
-      // Auto-scroll to bottom
-      if (transcriptionRef.current) {
-        transcriptionRef.current.scrollTop = transcriptionRef.current.scrollHeight;
-      }
-    });
+    );
 
     return () => {
-      unlisten.then(f => f());
-      unlistenTranscription.then(f => f());
+      unlisten.then((f) => f());
+      unlistenTranscription.then((f) => f());
       addDebugLog("Event listeners cleaned up");
     };
   }, []);
@@ -143,7 +148,9 @@ function App() {
 
     try {
       setError(null);
-      await invoke("start_audio_capture", { deviceName: selectedDevice || null });
+      await invoke("start_audio_capture", {
+        deviceName: selectedDevice || null,
+      });
       setIsRecording(true);
     } catch (err) {
       setError(`Failed to start recording: ${err}`);
@@ -167,24 +174,31 @@ function App() {
     try {
       // Get the new text since last processing
       const newText = transcriptionText.slice(lastProcessedText.length).trim();
-      
+
       if (!newText) {
         setError("No new text to process");
         return;
       }
 
       setIsLoadingResponse(true);
-      const response = await invoke<string>("get_interview_response", { transcription: newText });
-      
-      // Add to history
-      setResponseHistory(prev => [...prev, {
-        question: newText,
-        response: response,
-        timestamp: Date.now()
-      }]);
+      const response = await invoke<string>("get_interview_response", {
+        transcription: newText,
+        isFirstQuestion: isFirstQuestion,
+      });
 
-      // Update last processed text
+      // Add to history
+      setResponseHistory((prev) => [
+        ...prev,
+        {
+          question: newText,
+          response: response,
+          timestamp: Date.now(),
+        },
+      ]);
+
+      // Update last processed text and mark as not first question
       setLastProcessedText(transcriptionText);
+      setIsFirstQuestion(false);
     } catch (err) {
       setError(`Failed to get interview response: ${err}`);
     } finally {
@@ -194,62 +208,55 @@ function App() {
 
   return (
     <main className="app">
-      <header className="app-header">
-        <h1>DevCaption</h1>
-        <p>Real-time Audio Transcription</p>
-      </header>
-
       <div className="controls-panel">
-        <div className="permission-status">
-          {isCheckingPermissions ? (
-            <span className="status checking">Checking permissions...</span>
-          ) : hasPermissions ? (
-            <span className="status granted">✓ Audio permissions granted</span>
-          ) : (
-            <span className="status denied">⚠ Audio permissions required</span>
-          )}
-        </div>
-
         <div className="audio-controls">
-          <button 
-            className={`record-button ${isRecording ? 'recording' : ''}`}
+          <button
+            className={`record-button ${isRecording ? "recording" : ""}`}
             onClick={isRecording ? stopRecording : startRecording}
             disabled={isCheckingPermissions}
           >
-            {isRecording ? '⏹ Stop Recording' : '🎤 Start Recording'}
+            {isRecording ? "⏹ Stop Recording" : "🎤 Start Recording"}
           </button>
-          
-          <button 
+
+          <button
             className="process-button"
             onClick={getInterviewResponse}
-            disabled={!transcriptionText || isLoadingResponse || transcriptionText === lastProcessedText}
+            disabled={
+              !transcriptionText ||
+              isLoadingResponse ||
+              transcriptionText === lastProcessedText
+            }
           >
-            {isLoadingResponse ? '⏳ Processing...' : '💭 Get Response'}
+            {isLoadingResponse ? "⏳ Processing..." : "💭 Get Response"}
           </button>
-          
-          <button 
+
+          <button
             className="clear-button"
             onClick={() => {
               setTranscriptionText("");
               setLastProcessedText("");
               setCurrentTranscription("");
+              setIsFirstQuestion(true);
+              setResponseHistory([]);
             }}
             disabled={!transcriptionText}
           >
             🗑 Clear
           </button>
-          
-          <button 
+
+          <button
             className="export-button"
             onClick={() => {
               if (!transcriptionText.trim()) {
                 setError("No transcription to export");
                 return;
               }
-              
-              const blob = new Blob([transcriptionText], { type: 'text/plain' });
+
+              const blob = new Blob([transcriptionText], {
+                type: "text/plain",
+              });
               const url = URL.createObjectURL(blob);
-              const a = document.createElement('a');
+              const a = document.createElement("a");
               a.href = url;
               a.download = `transcription-${Date.now()}.txt`;
               document.body.appendChild(a);
@@ -267,18 +274,17 @@ function App() {
         <div className="audio-level-container">
           <label>Audio Level:</label>
           <div className="audio-level-meter">
-            <div 
-              ref={audioLevelRef}
-              className="audio-level-fill"
-            ></div>
+            <div ref={audioLevelRef} className="audio-level-fill"></div>
           </div>
-          <span className="audio-level-text">{(audioLevel * 100).toFixed(1)}%</span>
+          <span className="audio-level-text">
+            {(audioLevel * 100).toFixed(1)}%
+          </span>
         </div>
 
         {/* Device Selection */}
         <div className="device-selection">
           <label htmlFor="device-select">Audio Device:</label>
-          <select 
+          <select
             id="device-select"
             value={selectedDevice}
             onChange={(e) => setSelectedDevice(e.target.value)}
@@ -304,27 +310,19 @@ function App() {
               </span>
             )}
           </div>
-          
-          <div 
-            ref={transcriptionRef}
-            className="transcription-display"
-          >
+
+          <div ref={transcriptionRef} className="transcription-display">
             {transcriptionText && (
-              <div className="final-text">
-                {transcriptionText}
-              </div>
+              <div className="final-text">{transcriptionText}</div>
             )}
             {currentTranscription && (
-              <div className="current-text">
-                {currentTranscription}
-              </div>
+              <div className="current-text">{currentTranscription}</div>
             )}
             {!transcriptionText && !currentTranscription && (
               <div className="placeholder-text">
-                {isRecording 
-                  ? "Listening... Speak into your microphone" 
-                  : "Click 'Start Recording' to begin transcription"
-                }
+                {isRecording
+                  ? "Listening... Speak into your microphone"
+                  : "Click 'Start Recording' to begin transcription"}
               </div>
             )}
           </div>
@@ -334,23 +332,17 @@ function App() {
           <div className="response-header">
             <h2>Interview Responses</h2>
             {isLoadingResponse && (
-              <span className="loading-indicator">
-                Generating response...
-              </span>
+              <span className="loading-indicator">Generating response...</span>
             )}
           </div>
-          
+
           <div className="response-display">
             {responseHistory.length > 0 ? (
               <div className="response-history">
                 {responseHistory.map((item, index) => (
                   <div key={item.timestamp} className="response-item">
-                    <div className="response-question">
-                      Q: {item.question}
-                    </div>
-                    <div className="response-text">
-                      {item.response}
-                    </div>
+                    <div className="response-question">Q: {item.question}</div>
+                    <div className="response-text">{item.response}</div>
                     {index < responseHistory.length - 1 && (
                       <div className="response-divider" />
                     )}
@@ -370,10 +362,7 @@ function App() {
       {error && (
         <div className="error-panel">
           <span className="error-text">⚠ {error}</span>
-          <button 
-            className="error-dismiss"
-            onClick={() => setError(null)}
-          >
+          <button className="error-dismiss" onClick={() => setError(null)}>
             ×
           </button>
         </div>
@@ -382,7 +371,7 @@ function App() {
       {/* Status Bar */}
       <div className="status-bar">
         <span className="status-text">
-          {isRecording ? '🔴 Recording' : '⚪ Ready'}
+          {isRecording ? "🔴 Recording" : "⚪ Ready"}
         </span>
         <span className="device-info">
           {selectedDevice && `Device: ${selectedDevice}`}

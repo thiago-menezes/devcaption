@@ -301,7 +301,7 @@ async fn get_system_audio_setup() -> Result<String, String> {
 }
 
 #[tauri::command]
-async fn get_interview_response(transcription: String) -> Result<String, String> {
+async fn get_interview_response(transcription: String, is_first_question: bool) -> Result<String, String> {
     info!("Getting interview response for: {}", transcription);
     
     // Embed the prompt content directly
@@ -309,7 +309,7 @@ async fn get_interview_response(transcription: String) -> Result<String, String>
     
     let gemini = GeminiService::new(GEMINI_API_KEY.to_string(), context.to_string());
     
-    gemini.get_interview_response(&transcription)
+    gemini.get_interview_response(&transcription, is_first_question)
         .await
         .map_err(|e| e.to_string())
 }
