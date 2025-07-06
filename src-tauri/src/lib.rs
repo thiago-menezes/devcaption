@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 use log::{info, error};
 use tauri::Emitter;
 use serde_json;
-use std::time::{SystemTime, UNIX_EPOCH};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH, Duration, Instant};
+use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 
 mod audio_capture;
 mod speech_recognition;
@@ -38,9 +38,13 @@ static SPEECH_RECOGNIZER: Mutex<Option<Arc<Mutex<SpeechRecognizer>>>> = Mutex::n
 // Add this near the top with other static variables
 static LAST_TRANSCRIPTION_TIME: AtomicU64 = AtomicU64::new(0);
 static TRANSCRIPTION_BUFFER: Mutex<String> = Mutex::new(String::new());
+static IS_RECORDING: AtomicBool = AtomicBool::new(false);
+static LAST_VOICE_TIME: Mutex<Option<Instant>> = Mutex::new(None);
 
 // Constants
 const GEMINI_API_KEY: &str = "AIzaSyBzcVnMVBRXHGWbAhAaSQdoubc6YuLkcv8";
+const SILENCE_THRESHOLD: f64 = 0.1; // 10% threshold
+const SILENCE_DELAY: Duration = Duration::from_millis(800); // 0.8s delay
 
 #[tauri::command]
 async fn start_audio_capture(window: tauri::Window, device_name: Option<String>) -> Result<String, String> {
@@ -112,118 +116,96 @@ async fn start_audio_capture(window: tauri::Window, device_name: Option<String>)
                 .copied()
                 .collect();
             
-            // Add to buffer
-            audio_buffer.extend_from_slice(&resampled_data);
+            // Check if there's voice activity
+            let has_voice = level > SILENCE_THRESHOLD;
+            let now = Instant::now();
             
-            // Process when buffer is full
-            if audio_buffer.len() >= samples_per_buffer {
-                let chunk = audio_buffer.drain(..samples_per_buffer).collect::<Vec<f32>>();
+            if has_voice {
+                // Voice detected, start/continue recording
+                if let Ok(mut last_voice_time) = LAST_VOICE_TIME.lock() {
+                    *last_voice_time = Some(now);
+                }
                 
-                info!("Processing chunk with {} samples", chunk.len());
+                if !IS_RECORDING.load(Ordering::Relaxed) {
+                    info!("Voice detected, starting recording");
+                    IS_RECORDING.store(true, Ordering::Relaxed);
+                    audio_buffer.clear(); // Clear any old data
+                }
                 
-                let recognizer_clone = recognizer.clone();
-                let window_clone_inner = window_clone2.clone();
+                // Add current data to buffer
+                audio_buffer.extend_from_slice(&resampled_data);
                 
-                thread::spawn(move || {
-                    if let Ok(recognizer_lock) = recognizer_clone.lock() {
-                        match recognizer_lock.transcribe_audio(&chunk) {
-                            Ok(result) => {
-                                info!("Transcription result: '{}' (confidence: {:.2})", 
-                                    result.text, result.confidence);
+            } else {
+                // No voice, check if we should stop recording
+                if IS_RECORDING.load(Ordering::Relaxed) {
+                    if let Ok(last_voice_time) = LAST_VOICE_TIME.lock() {
+                        if let Some(last_time) = *last_voice_time {
+                            let silence_duration = now.duration_since(last_time);
+                            
+                            if silence_duration >= SILENCE_DELAY {
+                                info!("Silence detected for {:.2}s, stopping recording and processing", silence_duration.as_secs_f64());
+                                IS_RECORDING.store(false, Ordering::Relaxed);
                                 
-                                let result = TranscriptionResult {
-                                    text: result.text.trim().to_string(),
-                                    confidence: result.confidence,
-                                    timestamp: SystemTime::now()
-                                        .duration_since(UNIX_EPOCH)
-                                        .unwrap()
-                                        .as_millis() as u64,
-                                    is_final: false,  // Start as non-final
-                                };
-                                
-                                // Filter out unwanted results
-                                let should_skip = result.text.is_empty() 
-                                    || result.text.contains("[BLANK_AUDIO]")
-                                    || result.text.trim() == "you"
-                                    || result.text.trim().matches("you").count() > 2;
-                                
-                                if !should_skip {
-                                    let current_time = result.timestamp;
-                                    let last_time = LAST_TRANSCRIPTION_TIME.load(Ordering::Relaxed);
-                                    let time_diff = current_time - last_time;
+                                // Process the accumulated audio
+                                if !audio_buffer.is_empty() {
+                                    let chunk_to_process = audio_buffer.clone();
+                                    audio_buffer.clear();
                                     
-                                    if let Ok(mut buffer) = TRANSCRIPTION_BUFFER.lock() {
-                                        // If we have a significant pause, finalize the previous buffer
-                                        if time_diff > 1500 && !buffer.is_empty() {
-                                            let final_result = TranscriptionResult {
-                                                text: buffer.clone(),
-                                                confidence: result.confidence,
-                                                timestamp: current_time,
-                                                is_final: true,  // Mark as final
-                                            };
-                                            
-                                            info!("Finalizing previous transcription: {}", final_result.text);
-                                            if let Err(e) = window_clone_inner.emit("transcription-result", &final_result) {
-                                                error!("Failed to emit final transcription: {}", e);
-                                            }
-                                            
-                                            // Start new buffer with current text
-                                            *buffer = result.text.clone();
-                                        } else {
-                                            // No significant pause, append to buffer if not duplicate
-                                            if !buffer.contains(&result.text) {
-                                                if !buffer.is_empty() {
-                                                    buffer.push_str(" ");
+                                    info!("Processing accumulated audio with {} samples", chunk_to_process.len());
+                                    
+                                    let recognizer_clone = recognizer.clone();
+                                    let window_clone_inner = window_clone2.clone();
+                                    
+                                    thread::spawn(move || {
+                                        if let Ok(recognizer_lock) = recognizer_clone.lock() {
+                                            match recognizer_lock.transcribe_audio(&chunk_to_process) {
+                                                Ok(result) => {
+                                                    info!("Transcription result: '{}' (confidence: {:.2})", 
+                                                        result.text, result.confidence);
+                                                    
+                                                    let result = TranscriptionResult {
+                                                        text: result.text.trim().to_string(),
+                                                        confidence: result.confidence,
+                                                        timestamp: SystemTime::now()
+                                                            .duration_since(UNIX_EPOCH)
+                                                            .unwrap()
+                                                            .as_millis() as u64,
+                                                        is_final: true,  // Mark as final since we're done recording
+                                                    };
+                                                    
+                                                    // Filter out unwanted results
+                                                    let should_skip = result.text.is_empty() 
+                                                        || result.text.contains("[BLANK_AUDIO]")
+                                                        || result.text.trim() == "you"
+                                                        || result.text.trim().matches("you").count() > 2;
+                                                    
+                                                    if !should_skip {
+                                                        info!("Sending final transcription: {}", result.text);
+                                                        if let Err(e) = window_clone_inner.emit("transcription-result", &result) {
+                                                            error!("Failed to emit transcription: {}", e);
+                                                        }
+                                                        
+                                                        LAST_TRANSCRIPTION_TIME.store(result.timestamp, Ordering::Relaxed);
+                                                    } else {
+                                                        info!("Skipping unwanted result: {}", result.text);
+                                                    }
                                                 }
-                                                buffer.push_str(&result.text);
+                                                Err(e) => {
+                                                    error!("Transcription error: {}", e);
+                                                }
                                             }
+                                        } else {
+                                            error!("Failed to acquire recognizer lock");
                                         }
-                                        
-                                        // Always emit the current state as non-final
-                                        let current_result = TranscriptionResult {
-                                            text: buffer.clone(),
-                                            confidence: result.confidence,
-                                            timestamp: current_time,
-                                            is_final: false,
-                                        };
-                                        
-                                        info!("Sending current transcription: {}", current_result.text);
-                                        if let Err(e) = window_clone_inner.emit("transcription-result", &current_result) {
-                                            error!("Failed to emit current transcription: {}", e);
-                                        }
-                                    }
-                                    
-                                    LAST_TRANSCRIPTION_TIME.store(current_time, Ordering::Relaxed);
-                                } else {
-                                    // If we have a buffer and got silence, finalize it
-                                    if let Ok(mut buffer) = TRANSCRIPTION_BUFFER.lock() {
-                                        if !buffer.is_empty() {
-                                            let final_result = TranscriptionResult {
-                                                text: buffer.clone(),
-                                                confidence: result.confidence,
-                                                timestamp: result.timestamp,
-                                                is_final: true,
-                                            };
-                                            
-                                            info!("Finalizing transcription due to silence: {}", final_result.text);
-                                            if let Err(e) = window_clone_inner.emit("transcription-result", &final_result) {
-                                                error!("Failed to emit final transcription: {}", e);
-                                            }
-                                            
-                                            buffer.clear();
-                                        }
-                                    }
-                                    info!("Skipping unwanted result: {}", result.text);
+                                    });
                                 }
                             }
-                            Err(e) => {
-                                error!("Transcription error: {}", e);
-                            }
                         }
-                    } else {
-                        error!("Failed to acquire recognizer lock");
                     }
-                });
+                } else {
+                    // Not recording and no voice, just continue
+                    // We could add the current audio to buffer for smoothness, but we'll skip it
+                }
             }
         }) {
             error!("Audio capture error: {}", e);
@@ -243,6 +225,13 @@ async fn stop_audio_capture() -> Result<String, String> {
     
     if let Some(system) = capture_system.take() {
         system.stop_capture().map_err(|e| e.to_string())?;
+        
+        // Reset recording state
+        IS_RECORDING.store(false, Ordering::Relaxed);
+        if let Ok(mut last_voice_time) = LAST_VOICE_TIME.lock() {
+            *last_voice_time = None;
+        }
+        
         Ok("Audio capture and transcription stopped".to_string())
     } else {
         Err("Audio capture not running".to_string())
