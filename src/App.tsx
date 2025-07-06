@@ -15,6 +15,12 @@ interface AudioLevel {
   timestamp: number;
 }
 
+interface ResponseHistory {
+  question: string;
+  response: string;
+  timestamp: number;
+}
+
 // interface AudioDevice {
 //   name: string;
 //   id: string;
@@ -24,6 +30,9 @@ function App() {
   const [isRecording, setIsRecording] = useState(false);
   const [transcriptionText, setTranscriptionText] = useState("");
   const [currentTranscription, setCurrentTranscription] = useState("");
+  const [lastProcessedText, setLastProcessedText] = useState("");
+  const [responseHistory, setResponseHistory] = useState<ResponseHistory[]>([]);
+  const [isLoadingResponse, setIsLoadingResponse] = useState(false);
   const [audioLevel, setAudioLevel] = useState(0);
   const [audioDevices, setAudioDevices] = useState<string[]>([]);
   const [selectedDevice, setSelectedDevice] = useState<string>("");
@@ -31,9 +40,17 @@ function App() {
   const [isCheckingPermissions, setIsCheckingPermissions] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [confidence, setConfidence] = useState(0);
+  const [geminiResponse, setGeminiResponse] = useState<string>("");
+  const [debugLog, setDebugLog] = useState<string[]>([]);
+  const [currentResponse, setCurrentResponse] = useState<string>("");
   
   const transcriptionRef = useRef<HTMLDivElement>(null);
   const audioLevelRef = useRef<HTMLDivElement>(null);
+
+  const addDebugLog = (message: string) => {
+    console.log(message);
+    setDebugLog(prev => [...prev, `${new Date().toISOString()}: ${message}`]);
+  };
 
   useEffect(() => {
     // Check permissions on startup
@@ -43,6 +60,8 @@ function App() {
     getAudioDevices();
     
     // Listen for audio level updates
+    addDebugLog("Setting up event listeners");
+
     const unlisten = listen<AudioLevel>('audio-level', (event) => {
       const { level } = event.payload;
       setAudioLevel(level);
@@ -76,6 +95,7 @@ function App() {
     return () => {
       unlisten.then(f => f());
       unlistenTranscription.then(f => f());
+      addDebugLog("Event listeners cleaned up");
     };
   }, []);
 
@@ -143,27 +163,33 @@ function App() {
     }
   };
 
-  const clearTranscription = () => {
-    setTranscriptionText("");
-    setCurrentTranscription("");
-    setConfidence(0);
-  };
+  const getInterviewResponse = async () => {
+    try {
+      // Get the new text since last processing
+      const newText = transcriptionText.slice(lastProcessedText.length).trim();
+      
+      if (!newText) {
+        setError("No new text to process");
+        return;
+      }
 
-  const exportTranscription = () => {
-    if (!transcriptionText.trim()) {
-      setError("No transcription to export");
-      return;
+      setIsLoadingResponse(true);
+      const response = await invoke<string>("get_interview_response", { transcription: newText });
+      
+      // Add to history
+      setResponseHistory(prev => [...prev, {
+        question: newText,
+        response: response,
+        timestamp: Date.now()
+      }]);
+
+      // Update last processed text
+      setLastProcessedText(transcriptionText);
+    } catch (err) {
+      setError(`Failed to get interview response: ${err}`);
+    } finally {
+      setIsLoadingResponse(false);
     }
-    
-    const blob = new Blob([transcriptionText], { type: 'text/plain' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `transcription-${Date.now()}.txt`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
   };
 
   return (
@@ -194,16 +220,43 @@ function App() {
           </button>
           
           <button 
+            className="process-button"
+            onClick={getInterviewResponse}
+            disabled={!transcriptionText || isLoadingResponse || transcriptionText === lastProcessedText}
+          >
+            {isLoadingResponse ? '⏳ Processing...' : '💭 Get Response'}
+          </button>
+          
+          <button 
             className="clear-button"
-            onClick={clearTranscription}
-            disabled={!transcriptionText.trim()}
+            onClick={() => {
+              setTranscriptionText("");
+              setLastProcessedText("");
+              setCurrentTranscription("");
+            }}
+            disabled={!transcriptionText}
           >
             🗑 Clear
           </button>
           
           <button 
             className="export-button"
-            onClick={exportTranscription}
+            onClick={() => {
+              if (!transcriptionText.trim()) {
+                setError("No transcription to export");
+                return;
+              }
+              
+              const blob = new Blob([transcriptionText], { type: 'text/plain' });
+              const url = URL.createObjectURL(blob);
+              const a = document.createElement('a');
+              a.href = url;
+              a.download = `transcription-${Date.now()}.txt`;
+              document.body.appendChild(a);
+              a.click();
+              document.body.removeChild(a);
+              URL.revokeObjectURL(url);
+            }}
             disabled={!transcriptionText.trim()}
           >
             💾 Export
@@ -241,38 +294,75 @@ function App() {
       </div>
 
       {/* Transcription Display */}
-      <div className="transcription-panel">
-        <div className="transcription-header">
-          <h2>Transcription</h2>
-          {confidence > 0 && (
-            <span className="confidence-indicator">
-              Confidence: {(confidence * 100).toFixed(1)}%
-            </span>
-          )}
+      <div className="panels-container">
+        <div className="transcription-panel">
+          <div className="transcription-header">
+            <h2>Transcription</h2>
+            {confidence > 0 && (
+              <span className="confidence-indicator">
+                Confidence: {(confidence * 100).toFixed(1)}%
+              </span>
+            )}
+          </div>
+          
+          <div 
+            ref={transcriptionRef}
+            className="transcription-display"
+          >
+            {transcriptionText && (
+              <div className="final-text">
+                {transcriptionText}
+              </div>
+            )}
+            {currentTranscription && (
+              <div className="current-text">
+                {currentTranscription}
+              </div>
+            )}
+            {!transcriptionText && !currentTranscription && (
+              <div className="placeholder-text">
+                {isRecording 
+                  ? "Listening... Speak into your microphone" 
+                  : "Click 'Start Recording' to begin transcription"
+                }
+              </div>
+            )}
+          </div>
         </div>
-        
-        <div 
-          ref={transcriptionRef}
-          className="transcription-display"
-        >
-          {transcriptionText && (
-            <div className="final-text">
-              {transcriptionText}
-            </div>
-          )}
-          {currentTranscription && (
-            <div className="current-text">
-              {currentTranscription}
-            </div>
-          )}
-          {!transcriptionText && !currentTranscription && (
-            <div className="placeholder-text">
-              {isRecording 
-                ? "Listening... Speak into your microphone" 
-                : "Click 'Start Recording' to begin transcription"
-              }
-            </div>
-          )}
+
+        <div className="response-panel">
+          <div className="response-header">
+            <h2>Interview Responses</h2>
+            {isLoadingResponse && (
+              <span className="loading-indicator">
+                Generating response...
+              </span>
+            )}
+          </div>
+          
+          <div className="response-display">
+            {responseHistory.length > 0 ? (
+              <div className="response-history">
+                {responseHistory.map((item, index) => (
+                  <div key={item.timestamp} className="response-item">
+                    <div className="response-question">
+                      Q: {item.question}
+                    </div>
+                    <div className="response-text">
+                      {item.response}
+                    </div>
+                    {index < responseHistory.length - 1 && (
+                      <div className="response-divider" />
+                    )}
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="placeholder-text">
+                Your interview responses will appear here
+              </div>
+            )}
+          </div>
         </div>
       </div>
 

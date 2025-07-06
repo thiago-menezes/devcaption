@@ -3,14 +3,17 @@ use std::thread;
 use serde::{Deserialize, Serialize};
 use log::{info, error};
 use tauri::Emitter;
+use serde_json;
 
 mod audio_capture;
 mod speech_recognition;
 mod system_audio;
+mod gemini_service;
 
 use audio_capture::AudioCaptureSystem;
 use speech_recognition::SpeechRecognizer;
 use system_audio::SystemAudioHelper;
+use gemini_service::GeminiService;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranscriptionResult {
@@ -29,6 +32,9 @@ pub struct AudioLevel {
 // Global state for audio capture and speech recognition
 static CAPTURE_SYSTEM: Mutex<Option<Arc<AudioCaptureSystem>>> = Mutex::new(None);
 static SPEECH_RECOGNIZER: Mutex<Option<Arc<Mutex<SpeechRecognizer>>>> = Mutex::new(None);
+
+// Constants
+const GEMINI_API_KEY: &str = "AIzaSyBzcVnMVBRXHGWbAhAaSQdoubc6YuLkcv8";
 
 #[tauri::command]
 async fn start_audio_capture(window: tauri::Window, device_name: Option<String>) -> Result<String, String> {
@@ -293,6 +299,21 @@ async fn get_device_info() -> Result<String, String> {
 async fn get_system_audio_setup() -> Result<String, String> {
     Ok(SystemAudioHelper::get_setup_instructions())
 }
+
+#[tauri::command]
+async fn get_interview_response(transcription: String) -> Result<String, String> {
+    info!("Getting interview response for: {}", transcription);
+    
+    // Embed the prompt content directly
+    let context = include_str!("../../prompt.md");
+    
+    let gemini = GeminiService::new(GEMINI_API_KEY.to_string(), context.to_string());
+    
+    gemini.get_interview_response(&transcription)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -305,7 +326,8 @@ pub fn run() {
             request_permissions,
             find_system_audio_device,
             get_device_info,
-            get_system_audio_setup
+            get_system_audio_setup,
+            get_interview_response,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

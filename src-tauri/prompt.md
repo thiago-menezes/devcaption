@@ -1,0 +1,1 @@
+/Users/thiago/Projects/devcaption/prompt.md
