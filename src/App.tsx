@@ -40,9 +40,6 @@ function App() {
   const [isCheckingPermissions, setIsCheckingPermissions] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [confidence, setConfidence] = useState(0);
-  const [geminiResponse, setGeminiResponse] = useState<string>("");
-  const [debugLog, setDebugLog] = useState<string[]>([]);
-  const [currentResponse, setCurrentResponse] = useState<string>("");
   const [isFirstQuestion, setIsFirstQuestion] = useState(true);
 
   const transcriptionRef = useRef<HTMLDivElement>(null);
@@ -50,7 +47,6 @@ function App() {
 
   const addDebugLog = (message: string) => {
     console.log(message);
-    setDebugLog((prev) => [...prev, `${new Date().toISOString()}: ${message}`]);
   };
 
   useEffect(() => {
