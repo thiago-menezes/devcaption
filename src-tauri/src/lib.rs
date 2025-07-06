@@ -45,12 +45,13 @@ static LAST_VOICE_TIME: Mutex<Option<Instant>> = Mutex::new(None);
 static RECORDING_START_TIME: Mutex<Option<Instant>> = Mutex::new(None);
 static LAST_PARTIAL_PROCESSING: Mutex<Option<Instant>> = Mutex::new(None);
 static IS_PROCESSING: AtomicBool = AtomicBool::new(false);
+static LAST_RESPONSE_TIME: Mutex<Option<Instant>> = Mutex::new(None);
 
 // Constants
 const GEMINI_API_KEY: &str = "AIzaSyBzcVnMVBRXHGWbAhAaSQdoubc6YuLkcv8";
 const SILENCE_THRESHOLD: f64 = 0.05; // 5% threshold (more sensitive to catch quiet speech)
 const SILENCE_DELAY: Duration = Duration::from_millis(800); // 0.8s delay
-const STREAMING_CHUNK_SIZE: usize = 80000; // ~5 seconds at 16kHz for streaming
+const STREAMING_CHUNK_SIZE: usize = 48000; // ~3 seconds at 16kHz for streaming (smaller chunks)
 const MIN_CHUNK_SIZE: usize = 16000; // ~1 second minimum before processing
 
 #[tauri::command]
@@ -171,8 +172,9 @@ async fn start_audio_capture(window: tauri::Window, device_name: Option<String>)
                     let recognizer_clone = recognizer.clone();
                     let window_clone_inner = window_clone2.clone();
                     
+                    // Mark streaming chunks as FINAL to send immediately
                     thread::spawn(move || {
-                        process_audio_chunk(recognizer_clone, window_clone_inner, chunk_to_process, false);
+                        process_audio_chunk(recognizer_clone, window_clone_inner, chunk_to_process, true);
                         IS_PROCESSING.store(false, Ordering::Relaxed);
                     });
                 }
@@ -261,6 +263,9 @@ async fn stop_audio_capture() -> Result<String, String> {
         if let Ok(mut session_text) = CURRENT_SESSION_TEXT.lock() {
             session_text.clear();
         }
+        if let Ok(mut last_response_time) = LAST_RESPONSE_TIME.lock() {
+            *last_response_time = None;
+        }
         
         Ok("Audio capture and transcription stopped".to_string())
     } else {
@@ -326,55 +331,30 @@ fn process_audio_chunk(recognizer: Arc<Mutex<SpeechRecognizer>>, window: tauri::
                 || transcribed_text.trim().matches("you").count() > 2;
             
             if !should_skip {
-                // Handle text accumulation based on type
-                if let Ok(mut session_text) = CURRENT_SESSION_TEXT.lock() {
-                    if is_final {
-                        // For final results, add to accumulated text permanently
-                        if !session_text.is_empty() && !session_text.ends_with(' ') {
-                            session_text.push(' ');
-                        }
-                        session_text.push_str(&transcribed_text);
-                        
-                        let final_result = TranscriptionResult {
-                            text: session_text.clone(),
-                            confidence: result.confidence,
-                            timestamp: SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .unwrap()
-                                .as_millis() as u64,
-                            is_final: true,
-                        };
-                        
-                        info!("Sending FINAL accumulated transcription: {}", final_result.text);
-                        if let Err(e) = window.emit("transcription-result", &final_result) {
-                            error!("Failed to emit final transcription: {}", e);
-                        }
-                        
-                        LAST_TRANSCRIPTION_TIME.store(final_result.timestamp, Ordering::Relaxed);
-                    } else {
-                        // For streaming partial results, add to accumulated text for display
-                        // but don't make it permanent until final
-                        if !session_text.is_empty() && !session_text.ends_with(' ') {
-                            session_text.push(' ');
-                        }
-                        session_text.push_str(&transcribed_text);
-                        
-                        let partial_result = TranscriptionResult {
-                            text: session_text.clone(),
-                            confidence: result.confidence,
-                            timestamp: SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .unwrap()
-                                .as_millis() as u64,
-                            is_final: false,
-                        };
-                        
-                        info!("Sending PARTIAL accumulated transcription: {}", partial_result.text);
-                        if let Err(e) = window.emit("transcription-result", &partial_result) {
-                            error!("Failed to emit partial transcription: {}", e);
-                        }
-                    }
+                // Send each transcription result individually - no more accumulation
+                let individual_result = TranscriptionResult {
+                    text: transcribed_text.clone(),
+                    confidence: result.confidence,
+                    timestamp: SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis() as u64,
+                    is_final: true,  // Always mark as final for immediate processing
+                };
+                
+                info!("Sending individual transcription: {}", individual_result.text);
+                if let Err(e) = window.emit("transcription-result", &individual_result) {
+                    error!("Failed to emit transcription: {}", e);
                 }
+                
+                // Auto-send each chunk to Gemini for immediate response
+                let transcribed_text_for_response = transcribed_text.clone();
+                let window_clone = window.clone();
+                thread::spawn(move || {
+                    auto_generate_response(transcribed_text_for_response, window_clone);
+                });
+                
+                LAST_TRANSCRIPTION_TIME.store(individual_result.timestamp, Ordering::Relaxed);
             } else {
                 info!("Skipping unwanted result: {}", transcribed_text);
             }
@@ -388,6 +368,49 @@ fn process_audio_chunk(recognizer: Arc<Mutex<SpeechRecognizer>>, window: tauri::
     }
     
     info!("Audio processing completed");
+}
+
+fn auto_generate_response(transcribed_text: String, window: tauri::Window) {
+    info!("Auto-generating response for: {}", transcribed_text);
+    
+    // Skip very short or meaningless transcriptions
+    if transcribed_text.trim().len() < 5 {
+        info!("Skipping auto-response for very short text: {}", transcribed_text);
+        return;
+    }
+    
+    // Rate limiting: don't send too frequently (minimum 2 seconds between responses)
+    if let Ok(mut last_response_time) = LAST_RESPONSE_TIME.lock() {
+        let now = Instant::now();
+        if let Some(last_time) = *last_response_time {
+            if now.duration_since(last_time) < Duration::from_secs(2) {
+                info!("Rate limiting: skipping response (too soon)");
+                return;
+            }
+        }
+        *last_response_time = Some(now);
+    }
+    
+    // Get response from Gemini using tokio spawn
+    tokio::spawn(async move {
+        // Embed the prompt content directly like in the original function
+        let context = include_str!("../../prompt.md");
+        let gemini = GeminiService::new(GEMINI_API_KEY.to_string(), context.to_string());
+        
+        match gemini.get_interview_response(&transcribed_text, false).await {
+            Ok(response) => {
+                info!("Generated response: {}", response);
+                
+                // Emit the response to frontend
+                if let Err(e) = window.emit("interview-response", &response) {
+                    error!("Failed to emit interview response: {}", e);
+                }
+            }
+            Err(e) => {
+                error!("Failed to generate interview response: {}", e);
+            }
+        }
+    });
 }
 
 fn calculate_audio_level(audio_data: &[f32]) -> f64 {
