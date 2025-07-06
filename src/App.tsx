@@ -79,20 +79,32 @@ function App() {
       "transcription-result",
       (event) => {
         const { text, confidence, is_final } = event.payload;
+        console.log("Received transcription:", { text, confidence, is_final });
 
-        if (is_final) {
-          setTranscriptionText((prev) => prev + " " + text);
-          setCurrentTranscription("");
-        } else {
-          setCurrentTranscription(text);
-        }
+        if (text.trim()) {
+          if (is_final) {
+            // When we get a final result, append it to the main text
+            setTranscriptionText((prev) => {
+              // If this text is already at the end of prev, don't duplicate
+              if (prev.trim().endsWith(text.trim())) {
+                return prev;
+              }
+              return prev ? `${prev}\n${text}` : text;
+            });
+            // Clear the current transcription since it's now final
+            setCurrentTranscription("");
+          } else {
+            // Show non-final results in the current transcription area
+            setCurrentTranscription(text);
+          }
 
-        setConfidence(confidence);
+          setConfidence(confidence);
 
-        // Auto-scroll to bottom
-        if (transcriptionRef.current) {
-          transcriptionRef.current.scrollTop =
-            transcriptionRef.current.scrollHeight;
+          // Auto-scroll to bottom
+          if (transcriptionRef.current) {
+            transcriptionRef.current.scrollTop =
+              transcriptionRef.current.scrollHeight;
+          }
         }
       }
     );
@@ -224,7 +236,8 @@ function App() {
             disabled={
               !transcriptionText ||
               isLoadingResponse ||
-              transcriptionText === lastProcessedText
+              transcriptionText === lastProcessedText ||
+              currentTranscription.length > 0 // Disable while still transcribing
             }
           >
             {isLoadingResponse ? "⏳ Processing..." : "💭 Get Response"}
@@ -239,7 +252,7 @@ function App() {
               setIsFirstQuestion(true);
               setResponseHistory([]);
             }}
-            disabled={!transcriptionText}
+            disabled={!transcriptionText && !currentTranscription}
           >
             🗑 Clear
           </button>
@@ -247,12 +260,16 @@ function App() {
           <button
             className="export-button"
             onClick={() => {
-              if (!transcriptionText.trim()) {
+              const textToExport = [transcriptionText, currentTranscription]
+                .filter(Boolean)
+                .join("\n");
+
+              if (!textToExport.trim()) {
                 setError("No transcription to export");
                 return;
               }
 
-              const blob = new Blob([transcriptionText], {
+              const blob = new Blob([textToExport], {
                 type: "text/plain",
               });
               const url = URL.createObjectURL(blob);
@@ -264,7 +281,7 @@ function App() {
               document.body.removeChild(a);
               URL.revokeObjectURL(url);
             }}
-            disabled={!transcriptionText.trim()}
+            disabled={!transcriptionText && !currentTranscription}
           >
             💾 Export
           </button>

@@ -37,7 +37,9 @@ body {
   display: flex;
   flex-direction: column;
   height: 100vh;
-  max-height: 100vh;
+  padding: 1rem;
+  gap: 1rem;
+  overflow: hidden;
 }
 
 /* Remove header styles */
@@ -47,6 +49,7 @@ body {
 
 /* Controls panel */
 .controls-panel {
+  flex: 0 0 auto;
   padding: 1rem;
   background: var(--bg-secondary);
   border-bottom: 1px solid var(--border);
@@ -216,36 +219,31 @@ select:focus {
 
 /* Panels Container */
 .panels-container {
-  flex: 1;
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 1rem;
-  padding: 1rem;
+  flex: 1;
+  min-height: 0; /* Importante para o scroll funcionar */
   overflow: hidden;
-  min-height: 0; /* Important for scroll to work */
 }
 
 /* Transcription panel */
 .transcription-panel {
   display: flex;
   flex-direction: column;
-  overflow: hidden;
-  height: calc(100vh - 200px); /* Adjust based on header/controls height */
+  min-height: 0; /* Importante para o scroll funcionar */
 }
 
 /* Response panel */
 .response-panel {
   display: flex;
   flex-direction: column;
-  overflow: hidden;
-  height: calc(100vh - 200px); /* Adjust based on header/controls height */
+  min-height: 0; /* Importante para o scroll funcionar */
 }
 
 .transcription-header,
 .response-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
+  flex: 0 0 auto;
   margin-bottom: 0.5rem;
 }
 
@@ -268,13 +266,13 @@ select:focus {
 .transcription-display,
 .response-display {
   flex: 1;
-  background: var(--bg-secondary);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 1rem;
   overflow-y: auto;
-  font-size: 0.9rem;
-  line-height: 1.6;
+  padding: 1rem;
+  background: #1a1a1a;
+  border-radius: 8px;
+  font-size: 1.1rem;
+  line-height: 1.5;
+  white-space: pre-wrap;
 }
 
 .response-text {
@@ -289,21 +287,21 @@ select:focus {
 }
 
 .final-text {
-  color: var(--text-primary);
+  color: #ffffff;
   margin-bottom: 1rem;
 }
 
 .current-text {
-  color: var(--text-secondary);
+  color: #a0a0a0;
   font-style: italic;
-  opacity: 0.8;
+  border-left: 3px solid #404040;
+  padding-left: 0.5rem;
+  margin-top: 0.5rem;
 }
 
 .placeholder-text {
-  color: var(--text-muted);
-  text-align: center;
+  color: #666;
   font-style: italic;
-  margin-top: 2rem;
 }
 
 /* Custom scrollbar */

@@ -80,31 +80,22 @@ impl SpeechRecognizer {
         let ctx = self.whisper_context.as_ref()
             .ok_or("Whisper context not available")?;
 
-        info!("Transcribing audio chunk of {} samples", audio_data.len());
+        info!("Starting transcription of {} samples", audio_data.len());
 
         // Audio should already be mono and at 16kHz from the capture system
         let processed_audio = audio_data.to_vec();
 
-        if processed_audio.len() < 1600 { // Less than 0.1 second at 16kHz
-            return Ok(TranscriptionResult {
-                text: String::new(),
-                confidence: 0.0,
-                timestamp: SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64,
-                is_final: false,
-            });
-        }
-
         // Set up parameters for transcription
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-        params.set_n_threads(2); // Reduced for real-time performance
+        params.set_n_threads(4);
         params.set_translate(false);
         params.set_language(Some("en"));
         params.set_print_special(false);
         params.set_print_progress(false);
         params.set_print_realtime(false);
         params.set_print_timestamps(false);
-        params.set_no_context(true); // Better for real-time chunks
-        params.set_single_segment(true); // Process as single segment
+        params.set_no_context(true);
+        params.set_single_segment(true);
 
         // Run inference
         let mut state = ctx.create_state()?;
@@ -120,7 +111,6 @@ impl SpeechRecognizer {
             let segment_text = state.full_get_segment_text(segment_index)?;
             text.push_str(&segment_text);
             
-            // Calculate confidence (simplified)
             let num_tokens = state.full_n_tokens(segment_index)?;
             for token_index in 0..num_tokens {
                 let token_prob = state.full_get_token_prob(segment_index, token_index)?;
@@ -142,9 +132,7 @@ impl SpeechRecognizer {
             is_final: true,
         };
 
-        if !result.text.is_empty() {
-            info!("Transcription result: '{}' (confidence: {:.2})", result.text, result.confidence);
-        }
+        info!("Transcription completed: '{}' (confidence: {:.2})", result.text, result.confidence);
 
         Ok(result)
     }
